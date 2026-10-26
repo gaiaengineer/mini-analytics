@@ -1,0 +1,179 @@
+id: purchase_velocity
+title: Purchase Velocity
+description: Momentum — how many tokens are selling per day, how that's trending, and when people actually buy.
+
+blocks:
+  # --- KPIs ---------------------------------------------------------------
+  # All seriess are anchored to the most recent purchase_date in the data
+  # so the dashboard stays meaningful even if the feed falls behind.
+  - id: kpi_last_30d
+    type: kpi
+    title: Last 30 days
+    format: integer
+    subtitle: Purchases in the 30 days up to the latest record
+    sql: |
+      WITH anchor AS (
+        SELECT MAX(purchase_date) AS d
+        FROM fct_token_purchase WHERE is_purchased
+      )
+      SELECT COUNT(*) AS value
+      FROM fct_token_purchase, anchor
+      WHERE is_purchased
+        AND purchase_date > d - INTERVAL 30 DAY
+        AND purchase_date <= d
+
+  - id: kpi_prev_30d
+    type: kpi
+    title: Previous 30 days
+    format: integer
+    subtitle: Purchases 31–60 days before the latest record
+    sql: |
+      WITH anchor AS (
+        SELECT MAX(purchase_date) AS d
+        FROM fct_token_purchase WHERE is_purchased
+      )
+      SELECT COUNT(*) AS value
+      FROM fct_token_purchase, anchor
+      WHERE is_purchased
+        AND purchase_date > d - INTERVAL 60 DAY
+        AND purchase_date <= d - INTERVAL 30 DAY
+
+  - id: kpi_30d_growth
+    type: kpi
+    title: 30-day growth
+    format: percent
+    subtitle: last 30d ÷ previous 30d − 1
+    sql: |
+      WITH anchor AS (
+        SELECT MAX(purchase_date) AS d
+        FROM fct_token_purchase WHERE is_purchased
+      ),
+      w AS (
+        SELECT
+          COUNT(*) FILTER (WHERE purchase_date > d - INTERVAL 30 DAY AND purchase_date <= d)             AS last30,
+          COUNT(*) FILTER (WHERE purchase_date > d - INTERVAL 60 DAY AND purchase_date <= d - INTERVAL 30 DAY) AS prev30
+        FROM fct_token_purchase, anchor
+        WHERE is_purchased
+      )
+      SELECT CASE WHEN prev30 = 0 THEN NULL ELSE last30::DOUBLE / prev30 - 1 END AS value FROM w
+
+  - id: kpi_best_day
+    type: kpi
+    title: Best single day
+    format: integer
+    subtitle: Most purchases recorded on any one day
+    sql: |
+      WITH daily AS (
+        SELECT purchase_date AS day, COUNT(*) AS purchases
+        FROM fct_token_purchase
+        WHERE is_purchased AND purchase_date IS NOT NULL
+        GROUP BY 1
+      )
+      SELECT MAX(purchases) AS value FROM daily
+
+  # --- Charts -------------------------------------------------------------
+  - id: daily_purchases
+    type: line
+    title: Daily purchases
+    description: Raw per-day counts of purchased tokens.
+    format: integer
+    x: day
+    y: purchases
+    wide: true
+    sql: |
+      SELECT
+        purchase_date AS day,
+        COUNT(*)      AS purchases
+      FROM fct_token_purchase
+      WHERE is_purchased AND purchase_date IS NOT NULL
+      GROUP BY 1
+      ORDER BY 1
+
+  - id: rolling_7_vs_30
+    type: line
+    title: 7-day vs 30-day rolling average
+    description: Short-term noise vs long-term trend on one axis.
+    format: number
+    x: day
+    y: rolling_avg
+    color: series
+    wide: true
+    sql: |
+      WITH daily AS (
+        SELECT purchase_date AS day, COUNT(*) AS purchases
+        FROM fct_token_purchase
+        WHERE is_purchased AND purchase_date IS NOT NULL
+        GROUP BY 1
+      ),
+      rolled AS (
+        SELECT
+          day,
+          AVG(purchases) OVER (ORDER BY day ROWS BETWEEN 6  PRECEDING AND CURRENT ROW) AS r7,
+          AVG(purchases) OVER (ORDER BY day ROWS BETWEEN 29 PRECEDING AND CURRENT ROW) AS r30
+        FROM daily
+      )
+      SELECT day, '7-day'  AS series, r7  AS rolling_avg FROM rolled
+      UNION ALL
+      SELECT day, '30-day' AS series, r30 AS rolling_avg FROM rolled
+      ORDER BY day, series
+
+  - id: purchases_by_weekday
+    type: bar
+    title: Average purchases by weekday
+    description: Which days of the week are busiest?
+    format: number
+    x: weekday
+    y: avg_purchases
+    sql: |
+      WITH daily AS (
+        SELECT
+          purchase_date                AS day,
+          extract('dow' FROM purchase_date) AS dow,
+          COUNT(*)                     AS purchases
+        FROM fct_token_purchase
+        WHERE is_purchased AND purchase_date IS NOT NULL
+        GROUP BY 1, 2
+      )
+      SELECT
+        CASE dow
+          WHEN 0 THEN 'Sun' WHEN 1 THEN 'Mon' WHEN 2 THEN 'Tue'
+          WHEN 3 THEN 'Wed' WHEN 4 THEN 'Thu' WHEN 5 THEN 'Fri'
+          WHEN 6 THEN 'Sat'
+        END                            AS weekday,
+        ROUND(AVG(purchases), 2)       AS avg_purchases,
+        CASE dow WHEN 1 THEN 1 WHEN 2 THEN 2 WHEN 3 THEN 3
+                 WHEN 4 THEN 4 WHEN 5 THEN 5 WHEN 6 THEN 6 WHEN 0 THEN 7 END AS ord
+      FROM daily
+      GROUP BY dow
+      ORDER BY ord
+
+  - id: monthly_purchases
+    type: bar
+    title: Monthly purchases
+    description: Total purchased tokens per calendar month.
+    format: integer
+    x: month
+    y: purchases
+    sql: |
+      SELECT
+        date_trunc('month', purchase_date)::DATE AS month,
+        COUNT(*)                                 AS purchases
+      FROM fct_token_purchase
+      WHERE is_purchased AND purchase_date IS NOT NULL
+      GROUP BY 1
+      ORDER BY 1
+
+  - id: top_10_days
+    type: table
+    title: Top 10 single days by purchases
+    description: Busiest days on record.
+    sql: |
+      SELECT
+        purchase_date AS day,
+        COUNT(*)      AS purchases,
+        ROUND(SUM(price_cents) / 100.0, 2) AS gmv_usd
+      FROM fct_token_purchase
+      WHERE is_purchased AND purchase_date IS NOT NULL
+      GROUP BY 1
+      ORDER BY purchases DESC, day DESC
+      LIMIT 10

@@ -1,0 +1,90 @@
+id: author_leaderboard
+title: Author Leaderboard
+description: Who's selling? Top authors by revenue, GMV concentration, and a sortable detail table.
+
+blocks:
+  # --- KPIs ---------------------------------------------------------------
+  - id: kpi_total_authors
+    type: kpi
+    title: Authors in catalog
+    format: integer
+    sql: SELECT COUNT(*) AS value FROM dim_author
+
+  - id: kpi_authors_with_sales
+    type: kpi
+    title: Authors with sales
+    format: integer
+    sql: SELECT COUNT(*) AS value FROM dim_author WHERE gmv_cents > 0
+
+  - id: kpi_share_selling
+    type: kpi
+    title: Share with ≥1 sale
+    format: percent
+    sql: |
+      SELECT COUNT(*) FILTER (WHERE gmv_cents > 0)::DOUBLE
+             / NULLIF(COUNT(*), 0) AS value
+      FROM dim_author
+
+  - id: kpi_median_gmv
+    type: kpi
+    title: Median GMV (selling authors)
+    format: currency
+    subtitle: Half of selling authors earn below this
+    sql: |
+      SELECT quantile_cont(gmv_cents / 100.0, 0.5) AS value
+      FROM dim_author
+      WHERE gmv_cents > 0
+
+  # --- Charts -------------------------------------------------------------
+  - id: top_20_authors_gmv
+    type: bar
+    title: Top 20 authors by GMV
+    description: Highest-grossing authors, horizontal bars.
+    format: currency
+    orientation: h
+    x: gmv
+    y: author
+    height: 520
+    sql: |
+      WITH top AS (
+        SELECT COALESCE(name, '(unnamed)') AS author, gmv_cents / 100.0 AS gmv
+        FROM dim_author
+        WHERE gmv_cents > 0
+        ORDER BY gmv_cents DESC
+        LIMIT 20
+      )
+      SELECT author, gmv
+      FROM top
+      ORDER BY gmv ASC      -- ascending = highest ends up at the top in horizontal bar
+
+  - id: gmv_concentration
+    type: histogram
+    title: GMV concentration across selling authors
+    description: How revenue is distributed. A long right tail = a few whales dominate.
+    format: currency
+    x: author_gmv
+    nbins: 30
+    sql: |
+      SELECT gmv_cents / 100.0 AS author_gmv
+      FROM dim_author
+      WHERE gmv_cents > 0
+
+  - id: top_50_detail
+    type: table
+    title: Top 50 authors — detail
+    description: Books in catalog, tokens issued vs sold, GMV, and average selling price.
+    sql: |
+      SELECT
+        COALESCE(name, '(unnamed)')                                    AS author,
+        book_count                                                     AS books,
+        token_count                                                    AS tokens_issued,
+        tokens_sold,
+        ROUND(gmv_cents / 100.0, 2)                                    AS gmv_usd,
+        CASE
+          WHEN tokens_sold > 0
+            THEN ROUND(gmv_cents / 100.0 / tokens_sold, 2)
+        END                                                            AS avg_price_usd
+      FROM dim_author
+      WHERE gmv_cents > 0
+      ORDER BY gmv_cents DESC
+      LIMIT 50

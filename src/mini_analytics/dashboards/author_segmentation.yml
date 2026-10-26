@@ -1,0 +1,267 @@
+id: author_segmentation
+title: Author Segmentation & Activity Tiers
+description: Who are our whales, regulars, one-hitters, and dormant authors? Who's rising, who's fading?
+
+# Tier definitions, applied top-down:
+#   Never-sold  = total GMV is zero
+#   Dormant     = has sold, but nothing in the last 60 days of data
+#   Whale       = total GMV ≥ $100
+#   Regular     = total GMV between $10 and $100
+#   One-hitter  = total GMV under $10 (but ≥ $0.01)
+
+blocks:
+  # --- KPIs ---------------------------------------------------------------
+  - id: kpi_whales
+    type: kpi
+    title: Whales
+    format: integer
+    subtitle: Lifetime GMV ≥ $100, sold in last 60 days
+    sql: |
+      WITH anchor AS (
+        SELECT MAX(purchase_date) AS d FROM fct_token_purchase WHERE is_purchased
+      ),
+      last_sale AS (
+        SELECT author_id, MAX(purchase_date) AS ls
+        FROM fct_token_purchase
+        WHERE is_purchased AND purchase_date IS NOT NULL
+        GROUP BY author_id
+      )
+      SELECT COUNT(*) AS value
+      FROM dim_author a
+      LEFT JOIN last_sale l ON l.author_id = a.id
+      WHERE a.gmv_cents >= 10000
+        AND l.ls IS NOT NULL
+        AND l.ls >= (SELECT d FROM anchor) - INTERVAL 60 DAY
+
+  - id: kpi_regulars
+    type: kpi
+    title: Regulars
+    format: integer
+    subtitle: Lifetime GMV $10–$100, sold in last 60 days
+    sql: |
+      WITH anchor AS (
+        SELECT MAX(purchase_date) AS d FROM fct_token_purchase WHERE is_purchased
+      ),
+      last_sale AS (
+        SELECT author_id, MAX(purchase_date) AS ls
+        FROM fct_token_purchase
+        WHERE is_purchased AND purchase_date IS NOT NULL
+        GROUP BY author_id
+      )
+      SELECT COUNT(*) AS value
+      FROM dim_author a
+      LEFT JOIN last_sale l ON l.author_id = a.id
+      WHERE a.gmv_cents >= 1000 AND a.gmv_cents < 10000
+        AND l.ls IS NOT NULL
+        AND l.ls >= (SELECT d FROM anchor) - INTERVAL 60 DAY
+
+  - id: kpi_one_hitters
+    type: kpi
+    title: One-hitters
+    format: integer
+    subtitle: Lifetime GMV under $10, sold in last 60 days
+    sql: |
+      WITH anchor AS (
+        SELECT MAX(purchase_date) AS d FROM fct_token_purchase WHERE is_purchased
+      ),
+      last_sale AS (
+        SELECT author_id, MAX(purchase_date) AS ls
+        FROM fct_token_purchase
+        WHERE is_purchased AND purchase_date IS NOT NULL
+        GROUP BY author_id
+      )
+      SELECT COUNT(*) AS value
+      FROM dim_author a
+      LEFT JOIN last_sale l ON l.author_id = a.id
+      WHERE a.gmv_cents > 0 AND a.gmv_cents < 1000
+        AND l.ls IS NOT NULL
+        AND l.ls >= (SELECT d FROM anchor) - INTERVAL 60 DAY
+
+  - id: kpi_dormant
+    type: kpi
+    title: Dormant
+    format: integer
+    subtitle: Sold ever, but not in last 60 days
+    sql: |
+      WITH anchor AS (
+        SELECT MAX(purchase_date) AS d FROM fct_token_purchase WHERE is_purchased
+      ),
+      last_sale AS (
+        SELECT author_id, MAX(purchase_date) AS ls
+        FROM fct_token_purchase
+        WHERE is_purchased AND purchase_date IS NOT NULL
+        GROUP BY author_id
+      )
+      SELECT COUNT(*) AS value
+      FROM dim_author a
+      LEFT JOIN last_sale l ON l.author_id = a.id
+      WHERE a.gmv_cents > 0
+        AND (l.ls IS NULL OR l.ls < (SELECT d FROM anchor) - INTERVAL 60 DAY)
+
+  - id: kpi_never_sold
+    type: kpi
+    title: Never-sold
+    format: integer
+    subtitle: On the catalog but no GMV ever
+    sql: SELECT COUNT(*) AS value FROM dim_author WHERE gmv_cents = 0
+
+  # --- Charts -------------------------------------------------------------
+  - id: authors_per_active_tier
+    type: bar
+    title: Authors per active tier
+    description: Excludes Never-sold authors so the active-tier bars are readable. The Never-sold count is in the KPI strip above.
+    format: integer
+    x: tier
+    y: authors
+    wide: true
+    sql: |
+      WITH anchor AS (
+        SELECT MAX(purchase_date) AS d FROM fct_token_purchase WHERE is_purchased
+      ),
+      last_sale AS (
+        SELECT author_id, MAX(purchase_date) AS ls
+        FROM fct_token_purchase
+        WHERE is_purchased AND purchase_date IS NOT NULL
+        GROUP BY author_id
+      ),
+      tiered AS (
+        SELECT
+          CASE
+            WHEN l.ls IS NULL OR l.ls < (SELECT d FROM anchor) - INTERVAL 60 DAY THEN 'Dormant'
+            WHEN a.gmv_cents >= 10000                                            THEN 'Whale'
+            WHEN a.gmv_cents >= 1000                                             THEN 'Regular'
+            ELSE                                                                      'One-hitter'
+          END AS tier,
+          CASE
+            WHEN l.ls IS NULL OR l.ls < (SELECT d FROM anchor) - INTERVAL 60 DAY THEN 4
+            WHEN a.gmv_cents >= 10000                                            THEN 1
+            WHEN a.gmv_cents >= 1000                                             THEN 2
+            ELSE                                                                      3
+          END AS ord
+        FROM dim_author a
+        LEFT JOIN last_sale l ON l.author_id = a.id
+        WHERE a.gmv_cents > 0
+      )
+      SELECT tier, COUNT(*) AS authors
+      FROM tiered
+      GROUP BY tier, ord
+      ORDER BY ord
+
+  - id: gmv_by_tier_monthly
+    type: area_stacked
+    title: Share of GMV by tier — monthly
+    description: Tier uses each author's lifetime GMV (not per-month), so whales stay whales across the whole chart. Shows whether growth is driven by the top tier or by a broadening base.
+    format: currency
+    x: month
+    y: gmv
+    color: tier
+    sql: |
+      WITH tiered AS (
+        SELECT
+          id,
+          CASE
+            WHEN gmv_cents = 0        THEN 'Never-sold'
+            WHEN gmv_cents >= 10000   THEN 'Whale'
+            WHEN gmv_cents >= 1000    THEN 'Regular'
+            ELSE                           'One-hitter'
+          END AS tier
+        FROM dim_author
+      )
+      SELECT
+        date_trunc('month', f.purchase_date)::DATE AS month,
+        t.tier                                     AS tier,
+        SUM(f.price_cents) / 100.0                 AS gmv
+      FROM fct_token_purchase f
+      JOIN tiered t ON t.id = f.author_id
+      WHERE f.is_purchased AND f.purchase_date IS NOT NULL
+      GROUP BY 1, 2
+      ORDER BY 1, 2
+
+  - id: rising_stars
+    type: table
+    title: Rising stars (last 30d > prior 30d)
+    description: Authors whose revenue in the most recent 30 days exceeded the 30 days before that. Good candidates for promotion / partnerships.
+    sql: |
+      WITH anchor AS (
+        SELECT MAX(purchase_date) AS d FROM fct_token_purchase WHERE is_purchased
+      ),
+      windows AS (
+        SELECT
+          f.author_id,
+          SUM(CASE WHEN f.purchase_date >  (SELECT d FROM anchor) - INTERVAL 30 DAY
+                   THEN f.price_cents END) AS last30,
+          SUM(CASE WHEN f.purchase_date <= (SELECT d FROM anchor) - INTERVAL 30 DAY
+                   AND  f.purchase_date >  (SELECT d FROM anchor) - INTERVAL 60 DAY
+                   THEN f.price_cents END) AS prev30
+        FROM fct_token_purchase f
+        WHERE f.is_purchased AND f.author_id IS NOT NULL AND f.purchase_date IS NOT NULL
+        GROUP BY f.author_id
+      )
+      SELECT
+        COALESCE(a.name, '(unnamed)')              AS author,
+        ROUND(COALESCE(w.prev30, 0) / 100.0, 2)    AS prev_30d_usd,
+        ROUND(COALESCE(w.last30, 0) / 100.0, 2)    AS last_30d_usd,
+        ROUND(
+          (COALESCE(w.last30, 0) - COALESCE(w.prev30, 0))::DOUBLE
+          / NULLIF(COALESCE(w.prev30, 0), 0) * 100,
+          1
+        )                                          AS growth_pct
+      FROM windows w
+      JOIN authors a ON a.id = w.author_id
+      WHERE COALESCE(w.last30, 0) > COALESCE(w.prev30, 0)
+        AND COALESCE(w.prev30, 0) > 0
+      ORDER BY w.last30 DESC
+      LIMIT 20
+
+  - id: falling_stars
+    type: table
+    title: Falling stars (last 30d < prior 30d)
+    description: Authors who were selling 30–60 days ago but have dropped off. Candidates for reactivation outreach.
+    sql: |
+      WITH anchor AS (
+        SELECT MAX(purchase_date) AS d FROM fct_token_purchase WHERE is_purchased
+      ),
+      windows AS (
+        SELECT
+          f.author_id,
+          SUM(CASE WHEN f.purchase_date >  (SELECT d FROM anchor) - INTERVAL 30 DAY
+                   THEN f.price_cents END) AS last30,
+          SUM(CASE WHEN f.purchase_date <= (SELECT d FROM anchor) - INTERVAL 30 DAY
+                   AND  f.purchase_date >  (SELECT d FROM anchor) - INTERVAL 60 DAY
+                   THEN f.price_cents END) AS prev30
+        FROM fct_token_purchase f
+        WHERE f.is_purchased AND f.author_id IS NOT NULL AND f.purchase_date IS NOT NULL
+        GROUP BY f.author_id
+      )
+      SELECT
+        COALESCE(a.name, '(unnamed)')           AS author,
+        ROUND(COALESCE(w.prev30, 0) / 100.0, 2) AS prev_30d_usd,
+        ROUND(COALESCE(w.last30, 0) / 100.0, 2) AS last_30d_usd,
+        ROUND(
+          (COALESCE(w.last30, 0) - COALESCE(w.prev30, 0))::DOUBLE
+          / NULLIF(COALESCE(w.prev30, 0), 0) * 100,
+          1
+        )                                       AS growth_pct
+      FROM windows w
+      JOIN authors a ON a.id = w.author_id
+      WHERE COALESCE(w.prev30, 0) > 0
+        AND COALESCE(w.last30, 0) < COALESCE(w.prev30, 0)
+      ORDER BY w.prev30 DESC
+      LIMIT 20
+
+  - id: days_since_last_sale
+    type: histogram
+    title: Days since last sale
+    description: For authors who have ever sold. A bimodal distribution (lots recent, lots old) indicates a churn problem.
+    format: integer
+    x: days_since
+    nbins: 30
+    sql: |
+      WITH anchor AS (
+        SELECT MAX(purchase_date) AS d FROM fct_token_purchase WHERE is_purchased
+      )
+      SELECT
+        date_diff('day', MAX(purchase_date), (SELECT d FROM anchor)) AS days_since
+      FROM fct_token_purchase
+      WHERE is_purchased AND author_id IS NOT NULL AND purchase_date IS NOT NULL
+      GROUP BY author_id

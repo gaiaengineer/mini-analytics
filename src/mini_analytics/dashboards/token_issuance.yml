@@ -1,0 +1,154 @@
+id: token_issuance
+title: Token Issuance & Purchases
+description: For each book, how many tokens have been issued vs actually purchased, and where are the gaps?
+
+blocks:
+  # --- Context ------------------------------------------------------------
+  - id: note_issuance_semantics
+    type: note
+    title: How to read this dashboard
+    body: |
+      Each **token is one numbered digital copy of a book**; there is no physical inventory. Authors choose at publish time whether a book is **unlimited** (they can keep issuing copies) or **limited** (a fixed maximum can ever exist). For limited books, the author also chooses whether to **allow resale** of copies already sold.
+
+      **A gap between tokens issued and tokens purchased is not automatically a failure.** A token is issued **before** the buyer completes checkout with the payment provider. The gap can come from any of these, and the dataset cannot tell them apart:
+
+      • The buyer closed the browser before checkout completed.
+      • The payment provider declined the transaction.
+      • The marketplace failed to record a successful payment.
+      • The book is unlimited-supply and simply hasn't sold all its issued copies yet.
+
+      So "share of issued tokens that were purchased" is a **directional signal**, not a retail sell-through figure. A 20% rate on an unlimited-supply book means something very different from the same rate on a limited-supply book whose author expected to sell out. A `book_supply_type` flag in the source data would resolve this.
+
+  # --- KPIs ---------------------------------------------------------------
+  - id: kpi_tokens_issued
+    type: kpi
+    title: Tokens issued
+    format: integer
+    subtitle: Total issuance across all books
+    sql: SELECT COALESCE(SUM(token_count), 0) AS value FROM dim_book
+
+  - id: kpi_tokens_purchased
+    type: kpi
+    title: Tokens purchased
+    format: integer
+    subtitle: Issued tokens that cleared the payment provider (state = 'purchased')
+    sql: SELECT COALESCE(SUM(tokens_sold), 0) AS value FROM dim_book
+
+  - id: kpi_purchase_rate_overall
+    type: kpi
+    title: Overall purchase rate
+    format: percent
+    subtitle: Σ purchased ÷ Σ issued
+    sql: |
+      SELECT
+        COALESCE(SUM(tokens_sold), 0)::DOUBLE
+        / NULLIF(SUM(token_count), 0) AS value
+      FROM dim_book
+
+  - id: kpi_purchase_rate_median
+    type: kpi
+    title: Median purchase rate (per book)
+    format: percent
+    subtitle: Across books that have at least one issued token
+    sql: |
+      SELECT quantile_cont(tokens_sold::DOUBLE / token_count, 0.5) AS value
+      FROM dim_book
+      WHERE token_count > 0
+
+  # --- Charts -------------------------------------------------------------
+  - id: issuance_vs_purchases_scatter
+    type: scatter
+    title: Every book — issued vs purchased
+    description: One dot per book. X = tokens issued, Y = tokens purchased. Dots on the diagonal (y = x) had every issued token purchased; dots hugging the X-axis have mostly unpurchased issued tokens. Marker size scales with GMV.
+    x: token_count
+    y: tokens_sold
+    color: purchase_bucket
+    size: marker_size
+    wide: true
+    height: 520
+    sql: |
+      SELECT
+        token_count,
+        tokens_sold,
+        ROUND(gmv_cents / 100.0, 2)                         AS gmv_usd,
+        COALESCE(gmv_cents, 0) + 100                         AS marker_size,
+        CASE
+          WHEN tokens_sold = 0                                    THEN '0% (no purchases yet)'
+          WHEN tokens_sold::DOUBLE / token_count < 0.5            THEN '1–49% purchased'
+          WHEN tokens_sold::DOUBLE / token_count < 1.0            THEN '50–99% purchased'
+          ELSE                                                         '100% purchased'
+        END                                                   AS purchase_bucket
+      FROM dim_book
+      WHERE token_count > 0
+
+  - id: purchase_rate_by_issue_size
+    type: bar
+    title: Average purchase rate by issuance size
+    description: Does issuing more tokens per book reduce the share that gets purchased? Bucketed by the per-book token count.
+    format: percent
+    x: issue_bucket
+    y: avg_purchase_rate
+    sql: |
+      WITH b AS (
+        SELECT
+          tokens_sold::DOUBLE / token_count AS purchase_rate,
+          CASE
+            WHEN token_count = 1   THEN '1'
+            WHEN token_count <= 5  THEN '2–5'
+            WHEN token_count <= 10 THEN '6–10'
+            WHEN token_count <= 50 THEN '11–50'
+            ELSE                        '51+'
+          END AS issue_bucket,
+          CASE
+            WHEN token_count = 1   THEN 1
+            WHEN token_count <= 5  THEN 2
+            WHEN token_count <= 10 THEN 3
+            WHEN token_count <= 50 THEN 4
+            ELSE                        5
+          END AS ord
+        FROM dim_book
+        WHERE token_count > 0
+      )
+      SELECT issue_bucket,
+             AVG(purchase_rate) AS avg_purchase_rate,
+             COUNT(*)           AS books
+      FROM b
+      GROUP BY issue_bucket, ord
+      ORDER BY ord
+
+  - id: largest_issuance_gap
+    type: table
+    title: Books with the largest issuance–purchase gap
+    description: Books where many tokens were issued but few completed checkout. Remember the gap has four possible causes (see the note above) — this is a triage list, not a verdict.
+    sql: |
+      SELECT
+        COALESCE(b.title, '(untitled)')                        AS book,
+        COALESCE(a.name,  '(unknown)')                         AS author,
+        b.token_count                                          AS tokens_issued,
+        b.tokens_sold                                          AS tokens_purchased,
+        (b.token_count - b.tokens_sold)                        AS unpurchased,
+        ROUND(b.tokens_sold::DOUBLE / b.token_count * 100, 1)  AS purchase_rate_pct
+      FROM dim_book b
+      LEFT JOIN dim_author a ON a.id = b.author_id
+      WHERE b.token_count > 0
+      ORDER BY unpurchased DESC, b.token_count DESC
+      LIMIT 20
+
+  - id: nearly_fully_purchased
+    type: table
+    title: Books where nearly all issued tokens have been purchased (≥90%)
+    description: For limited-supply books, these are candidates for a new issue. For unlimited-supply books, nothing to do — the author can just keep issuing.
+    sql: |
+      SELECT
+        COALESCE(b.title, '(untitled)')                        AS book,
+        COALESCE(a.name,  '(unknown)')                         AS author,
+        b.token_count                                          AS tokens_issued,
+        b.tokens_sold                                          AS tokens_purchased,
+        ROUND(b.tokens_sold::DOUBLE / b.token_count * 100, 1)  AS purchase_rate_pct,
+        ROUND(b.gmv_cents / 100.0, 2)                          AS gmv_usd
+      FROM dim_book b
+      LEFT JOIN dim_author a ON a.id = b.author_id
+      WHERE b.token_count > 0
+        AND b.tokens_sold::DOUBLE / b.token_count >= 0.9
+      ORDER BY purchase_rate_pct DESC, gmv_usd DESC
+      LIMIT 20

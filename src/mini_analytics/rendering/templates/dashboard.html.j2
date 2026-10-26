@@ -1,0 +1,43 @@
+{% extends "base.html.j2" %}
+{% block title %}{{ dashboard.title }} · Mini Analytics{% endblock %}
+{% block content %}
+  <h2 class="page-title">{{ dashboard.title }}</h2>
+  {% if dashboard.description %}<p class="page-desc">{{ dashboard.description }}</p>{% endif %}
+
+  {% set kpis   = rendered | selectattr('block.type', 'equalto', kpi_type)  | list %}
+  {% set notes  = rendered | selectattr('block.type', 'equalto', 'note')     | list %}
+  {% set others = rendered | rejectattr('block.type', 'equalto', kpi_type)
+                           | rejectattr('block.type', 'equalto', 'note')     | list %}
+
+  {% if kpis %}
+  <div class="kpi-strip">
+    {% for r in kpis %}{{ r.html | safe }}{% endfor %}
+  </div>
+  {% endif %}
+
+  {% for r in notes %}
+    <aside class="note" id="{{ r.block.id }}">
+      <div class="note-title">{{ r.block.title }}</div>
+      <div class="note-body">{{ r.html | safe }}</div>
+    </aside>
+  {% endfor %}
+
+  <div class="blocks">
+    {% for r in others %}
+    <section class="block {% if r.block.wide or r.block.type == 'area_stacked' or r.block.type == 'table' %}wide{% endif %}" id="{{ r.block.id }}">
+      <div class="block-head">
+        <div>
+          <div class="block-title">{{ r.block.title }}</div>
+          {% if r.block.description %}<div class="block-desc">{{ r.block.description }}</div>{% endif %}
+        </div>
+        <div class="downloads">
+          {% if r.csv_path %}
+            <a class="download-btn" href="{{ r.csv_path }}" download>Download CSV</a>
+          {% endif %}
+        </div>
+      </div>
+      <div class="block-body">{{ r.html | safe }}</div>
+    </section>
+    {% endfor %}
+  </div>
+{% endblock %}

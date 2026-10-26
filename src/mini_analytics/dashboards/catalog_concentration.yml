@@ -1,0 +1,177 @@
+id: catalog_concentration
+title: Catalog Concentration & Pareto
+description: How fragile is revenue? What share of GMV comes from the top few authors and books?
+
+blocks:
+  # --- KPIs ---------------------------------------------------------------
+  - id: kpi_top1_author_share
+    type: kpi
+    title: Top-1 author share
+    format: percent
+    subtitle: Highest-grossing author ÷ total GMV
+    sql: |
+      SELECT
+        MAX(gmv_cents)::DOUBLE / NULLIF(SUM(gmv_cents), 0) AS value
+      FROM dim_author
+
+  - id: kpi_top10_author_share
+    type: kpi
+    title: Top-10 authors share
+    format: percent
+    sql: |
+      WITH ranked AS (
+        SELECT gmv_cents,
+               ROW_NUMBER() OVER (ORDER BY gmv_cents DESC) AS rnk
+        FROM dim_author
+      )
+      SELECT
+        SUM(CASE WHEN rnk <= 10 THEN gmv_cents ELSE 0 END)::DOUBLE
+        / NULLIF(SUM(gmv_cents), 0) AS value
+      FROM ranked
+
+  - id: kpi_top10_book_share
+    type: kpi
+    title: Top-10 books share
+    format: percent
+    sql: |
+      WITH ranked AS (
+        SELECT gmv_cents,
+               ROW_NUMBER() OVER (ORDER BY gmv_cents DESC) AS rnk
+        FROM dim_book
+      )
+      SELECT
+        SUM(CASE WHEN rnk <= 10 THEN gmv_cents ELSE 0 END)::DOUBLE
+        / NULLIF(SUM(gmv_cents), 0) AS value
+      FROM ranked
+
+  - id: kpi_author_gini
+    type: kpi
+    title: Author GMV Gini
+    format: number
+    subtitle: 0 = perfectly equal · 1 = one author captures everything
+    sql: |
+      WITH sorted AS (
+        SELECT gmv_cents,
+               ROW_NUMBER() OVER (ORDER BY gmv_cents ASC) AS i
+        FROM dim_author
+      )
+      SELECT
+        (2.0 * SUM(i * gmv_cents) / NULLIF(COUNT(*) * SUM(gmv_cents), 0))
+        - ((COUNT(*) + 1.0) / COUNT(*))                                     AS value
+      FROM sorted
+
+  # --- Charts -------------------------------------------------------------
+  - id: lorenz_authors
+    type: line
+    title: Lorenz curve — authors
+    description: X = cumulative share of authors (sorted low-to-high GMV). Y = cumulative share of GMV. A straight diagonal = perfect equality; the more the line is pushed to the bottom-right, the more concentrated revenue is.
+    format: percent
+    x: author_pct
+    y: gmv_pct
+    wide: true
+    sql: |
+      WITH sorted AS (
+        SELECT gmv_cents,
+               ROW_NUMBER() OVER (ORDER BY gmv_cents ASC) AS i
+        FROM dim_author
+      ),
+      stats AS (
+        SELECT COUNT(*) AS n, SUM(gmv_cents) AS total FROM sorted
+      )
+      SELECT
+        i::DOUBLE / (SELECT n FROM stats)                                    AS author_pct,
+        SUM(gmv_cents) OVER (ORDER BY i)::DOUBLE
+          / NULLIF((SELECT total FROM stats), 0)                             AS gmv_pct
+      FROM sorted
+      ORDER BY i
+
+  - id: top_10_authors_share
+    type: bar
+    title: Top-10 authors — individual share of GMV
+    format: percent
+    x: share
+    y: author
+    orientation: h
+    height: 360
+    sql: |
+      WITH top AS (
+        SELECT
+          COALESCE(name, '(unnamed)')                                              AS author,
+          gmv_cents::DOUBLE / NULLIF((SELECT SUM(gmv_cents) FROM dim_author), 0)   AS share
+        FROM dim_author
+        ORDER BY gmv_cents DESC
+        LIMIT 10
+      )
+      SELECT author, share FROM top ORDER BY share ASC
+
+  - id: top_10_books_share
+    type: bar
+    title: Top-10 books — individual share of GMV
+    format: percent
+    x: share
+    y: book
+    orientation: h
+    height: 360
+    sql: |
+      WITH top AS (
+        SELECT
+          COALESCE(b.title, '(untitled)')                                        AS book,
+          b.gmv_cents::DOUBLE / NULLIF((SELECT SUM(gmv_cents) FROM dim_book), 0) AS share
+        FROM dim_book b
+        ORDER BY b.gmv_cents DESC
+        LIMIT 10
+      )
+      SELECT book, share FROM top ORDER BY share ASC
+
+  - id: concentration_trend
+    type: line
+    title: Top-10 authors' share of GMV — monthly
+    description: For each month, what share of that month's GMV did the month's top-10 authors capture? A rising line = revenue is concentrating further.
+    format: percent
+    x: month
+    y: top10_share
+    wide: true
+    sql: |
+      WITH monthly_author AS (
+        SELECT
+          date_trunc('month', purchase_date)::DATE AS month,
+          author_id,
+          SUM(price_cents)                         AS gmv
+        FROM fct_token_purchase
+        WHERE is_purchased AND purchase_date IS NOT NULL AND author_id IS NOT NULL
+        GROUP BY 1, 2
+      ),
+      ranked AS (
+        SELECT month, gmv,
+               ROW_NUMBER() OVER (PARTITION BY month ORDER BY gmv DESC) AS rnk
+        FROM monthly_author
+      )
+      SELECT
+        month,
+        SUM(CASE WHEN rnk <= 10 THEN gmv ELSE 0 END)::DOUBLE
+          / NULLIF(SUM(gmv), 0)                                 AS top10_share
+      FROM ranked
+      GROUP BY month
+      ORDER BY month
+
+  - id: if_top_author_left
+    type: table
+    title: "If this author left… (top 5)"
+    description: For each of the top-5 authors, how much GMV would remain if they disappeared, and what share of total that represents.
+    sql: |
+      WITH top_authors AS (
+        SELECT id,
+               COALESCE(name, '(unnamed)') AS name,
+               gmv_cents
+        FROM dim_author
+        ORDER BY gmv_cents DESC
+        LIMIT 5
+      ),
+      tot AS (SELECT SUM(gmv_cents) AS total FROM dim_author)
+      SELECT
+        t.name                                                       AS dropped_author,
+        ROUND(t.gmv_cents / 100.0, 2)                                AS their_gmv_usd,
+        ROUND((tot.total - t.gmv_cents) / 100.0, 2)                  AS remaining_gmv_usd,
+        ROUND(t.gmv_cents::DOUBLE / NULLIF(tot.total, 0) * 100, 1)   AS pct_of_total_lost
+      FROM top_authors t, tot
+      ORDER BY t.gmv_cents DESC

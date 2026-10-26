@@ -1,0 +1,210 @@
+id: conversion_funnel
+title: Conversion Funnel (attempts → purchased)
+description: Of every token someone started buying, how many actually went through, and where do the rest drop off? The classic e-commerce attempts-to-purchased funnel.
+
+# States in the raw data:
+#   initiated → prepared → purchased   (the happy path)
+#                          failed      (terminal failure)
+# A token can have rows in multiple states over time. "Purchased" is the success.
+
+blocks:
+  # --- Context ------------------------------------------------------------
+  - id: note_funnel_semantics
+    type: note
+    title: Why this funnel has three possible causes of drop-off
+    body: |
+      Each token (a numbered digital copy) is reserved **before** the buyer completes checkout with the payment provider. So a token that never reaches `state = 'purchased'` can be explained by any of these, which the dataset cannot tell apart:
+
+      • The buyer **abandoned** checkout and closed the tab.
+      • **The payment provider declined** the transaction (insufficient funds, fraud check, etc.).
+      • **The marketplace** failed to record the success after the provider approved it.
+
+      Treat "tokens attempted but not purchased" as an **upper bound on lost revenue**, not a UX verdict. A separate `payment_result` signal would be needed to attribute these three causes.
+
+  # --- KPIs ---------------------------------------------------------------
+  - id: kpi_tokens_attempted
+    type: kpi
+    title: Tokens attempted
+    format: integer
+    subtitle: Distinct tokens with ≥1 row in any state
+    sql: SELECT COUNT(DISTINCT token_id) AS value FROM token_purchases
+
+  - id: kpi_tokens_purchased
+    type: kpi
+    title: Tokens purchased
+    format: integer
+    subtitle: Distinct tokens that reached state='purchased'
+    sql: |
+      SELECT COUNT(DISTINCT token_id) AS value
+      FROM token_purchases WHERE state = 'purchased'
+
+  - id: kpi_conversion_rate
+    type: kpi
+    title: Attempts → purchased
+    format: percent
+    subtitle: purchased ÷ attempted
+    sql: |
+      SELECT
+        (SELECT COUNT(DISTINCT token_id) FROM token_purchases WHERE state = 'purchased')::DOUBLE
+        / NULLIF((SELECT COUNT(DISTINCT token_id) FROM token_purchases), 0) AS value
+
+  - id: kpi_unconverted
+    type: kpi
+    title: Attempts that never sold
+    format: integer
+    subtitle: Tokens that got some attempt but never reached 'purchased'
+    sql: |
+      SELECT
+        (SELECT COUNT(DISTINCT token_id) FROM token_purchases)
+        - (SELECT COUNT(DISTINCT token_id) FROM token_purchases WHERE state = 'purchased') AS value
+
+  # --- Charts -------------------------------------------------------------
+  - id: monthly_conversion_rate
+    type: line
+    title: Monthly conversion rate
+    description: Per month of first-seen token (earliest created_at), what share ended up purchased? Is the funnel getting better or worse?
+    format: percent
+    x: month
+    y: conversion_rate
+    wide: true
+    sql: |
+      WITH first_seen AS (
+        SELECT token_id, MIN(created_at) AS first_seen_at
+        FROM token_purchases
+        GROUP BY token_id
+      ),
+      any_purchased AS (
+        SELECT DISTINCT token_id FROM token_purchases WHERE state = 'purchased'
+      )
+      SELECT
+        date_trunc('month', fs.first_seen_at)::DATE                      AS month,
+        COUNT(ap.token_id)::DOUBLE / NULLIF(COUNT(*), 0)                  AS conversion_rate
+      FROM first_seen fs
+      LEFT JOIN any_purchased ap USING (token_id)
+      GROUP BY 1
+      ORDER BY 1
+
+  - id: furthest_stage_reached
+    type: bar
+    title: Furthest stage reached — non-purchased attempts
+    description: For the tokens that didn't end up sold, how far did they get before dropping off? Reveals where the funnel leaks.
+    format: integer
+    x: stage
+    y: tokens
+    sql: |
+      WITH per_token AS (
+        SELECT
+          token_id,
+          MAX(CASE WHEN state = 'purchased' THEN 4
+                   WHEN state = 'failed'    THEN 3
+                   WHEN state = 'prepared'  THEN 2
+                   WHEN state = 'initiated' THEN 1 END) AS furthest_ord
+        FROM token_purchases
+        GROUP BY token_id
+      )
+      SELECT
+        CASE furthest_ord
+          WHEN 1 THEN 'Stuck at initiated'
+          WHEN 2 THEN 'Stuck at prepared'
+          WHEN 3 THEN 'Failed'
+        END                AS stage,
+        COUNT(*)           AS tokens,
+        furthest_ord       AS ord
+      FROM per_token
+      WHERE furthest_ord < 4        -- exclude purchased
+      GROUP BY stage, furthest_ord
+      ORDER BY ord
+
+  - id: conversion_by_flow
+    type: bar
+    title: Conversion rate by flow type
+    description: Does primary convert better than resale?
+    format: percent
+    x: flow_type
+    y: conversion_rate
+    sql: |
+      WITH per_token AS (
+        SELECT
+          token_id,
+          COALESCE(
+            MAX(CASE WHEN state = 'purchased' THEN flow_type END),
+            ANY_VALUE(flow_type),
+            'unknown'
+          )                                                          AS flow_type,
+          MAX(CASE WHEN state = 'purchased' THEN 1 ELSE 0 END)       AS is_converted
+        FROM token_purchases
+        GROUP BY token_id
+      )
+      SELECT
+        flow_type,
+        SUM(is_converted)::DOUBLE / COUNT(*) AS conversion_rate,
+        COUNT(*)                             AS tokens
+      FROM per_token
+      GROUP BY flow_type
+      ORDER BY tokens DESC
+
+  - id: conversion_by_price_band
+    type: bar
+    title: Conversion rate by price band
+    description: Does cheaper convert better? Price band uses the purchased row's price, or the attempted row's average if no purchase happened.
+    format: percent
+    x: price_band
+    y: conversion_rate
+    sql: |
+      WITH per_token AS (
+        SELECT
+          token_id,
+          COALESCE(
+            MAX(CASE WHEN state = 'purchased' THEN price_cents END),
+            CAST(AVG(price_cents) AS INTEGER)
+          )                                                    AS price_cents,
+          MAX(CASE WHEN state = 'purchased' THEN 1 ELSE 0 END) AS is_converted
+        FROM token_purchases
+        GROUP BY token_id
+      )
+      SELECT
+        CASE
+          WHEN price_cents < 100  THEN '$0–1'
+          WHEN price_cents < 300  THEN '$1–3'
+          WHEN price_cents < 500  THEN '$3–5'
+          WHEN price_cents < 1000 THEN '$5–10'
+          ELSE                         '$10+'
+        END                                        AS price_band,
+        SUM(is_converted)::DOUBLE / COUNT(*)       AS conversion_rate,
+        COUNT(*)                                   AS tokens,
+        CASE
+          WHEN price_cents < 100  THEN 1
+          WHEN price_cents < 300  THEN 2
+          WHEN price_cents < 500  THEN 3
+          WHEN price_cents < 1000 THEN 4
+          ELSE                         5
+        END                                        AS ord
+      FROM per_token
+      GROUP BY price_band, ord
+      ORDER BY ord
+
+  - id: worst_converting_books
+    type: table
+    title: Worst-converting books (≥3 attempts)
+    description: Books with at least three attempts and the lowest share making it to purchased. Candidates for checkout-UX or pricing investigation.
+    sql: |
+      WITH per_token AS (
+        SELECT token_id,
+               MAX(CASE WHEN state = 'purchased' THEN 1 ELSE 0 END) AS is_converted
+        FROM token_purchases
+        GROUP BY token_id
+      )
+      SELECT
+        COALESCE(b.title, '(untitled)')                                     AS book,
+        COALESCE(a.name,  '(unknown)')                                      AS author,
+        COUNT(*)                                                            AS tokens_attempted,
+        SUM(pt.is_converted)                                                AS tokens_purchased,
+        ROUND(SUM(pt.is_converted)::DOUBLE / COUNT(*) * 100, 1)             AS conversion_pct
+      FROM per_token pt
+      JOIN tokens t  ON t.id = pt.token_id
+      JOIN books  b  ON b.id = t.book_id
+      LEFT JOIN authors a ON a.id = b.author_id
+      GROUP BY 1, 2
+      HAVING COUNT(*) >= 3
+      ORDER BY conversion_pct ASC, tokens_attempted DESC
+      LIMIT 20

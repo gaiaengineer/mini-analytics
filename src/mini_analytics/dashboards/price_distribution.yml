@@ -1,0 +1,116 @@
+id: price_distribution
+title: Price Distribution
+description: How tokens are priced and whether pricing is shifting over time.
+
+blocks:
+  # --- KPIs ---------------------------------------------------------------
+  - id: kpi_min_price
+    type: kpi
+    title: Min price
+    format: currency
+    sql: |
+      SELECT MIN(price_cents) / 100.0 AS value
+      FROM fct_token_purchase WHERE is_purchased
+
+  - id: kpi_median_price
+    type: kpi
+    title: Median price
+    format: currency
+    sql: |
+      SELECT quantile_cont(price_cents / 100.0, 0.5) AS value
+      FROM fct_token_purchase WHERE is_purchased
+
+  - id: kpi_avg_price
+    type: kpi
+    title: Avg selling price
+    format: currency
+    sql: |
+      SELECT AVG(price_cents) / 100.0 AS value
+      FROM fct_token_purchase WHERE is_purchased
+
+  - id: kpi_max_price
+    type: kpi
+    title: Max price
+    format: currency
+    sql: |
+      SELECT MAX(price_cents) / 100.0 AS value
+      FROM fct_token_purchase WHERE is_purchased
+
+  # --- Charts -------------------------------------------------------------
+  - id: price_histogram
+    type: histogram
+    title: Price distribution (all purchased tokens)
+    description: Full shape of purchased-token pricing.
+    format: currency
+    x: price_usd
+    nbins: 40
+    wide: true
+    sql: |
+      SELECT price_cents / 100.0 AS price_usd
+      FROM fct_token_purchase WHERE is_purchased
+
+  - id: price_by_flow
+    type: histogram
+    title: Price by flow type (overlay)
+    description: Primary vs resale vs unknown, overlaid.
+    format: currency
+    x: price_usd
+    color: flow_type
+    nbins: 30
+    sql: |
+      SELECT price_cents / 100.0 AS price_usd, flow_type
+      FROM fct_token_purchase WHERE is_purchased
+
+  - id: percentiles_by_flow
+    type: table
+    title: Price percentiles by flow type
+    description: p10 / p25 / p50 / p75 / p90 selling price per flow.
+    sql: |
+      SELECT
+        flow_type,
+        COUNT(*) AS n,
+        ROUND(quantile_cont(price_cents / 100.0, 0.10), 2) AS p10,
+        ROUND(quantile_cont(price_cents / 100.0, 0.25), 2) AS p25,
+        ROUND(quantile_cont(price_cents / 100.0, 0.50), 2) AS p50,
+        ROUND(quantile_cont(price_cents / 100.0, 0.75), 2) AS p75,
+        ROUND(quantile_cont(price_cents / 100.0, 0.90), 2) AS p90
+      FROM fct_token_purchase
+      WHERE is_purchased
+      GROUP BY flow_type
+      ORDER BY n DESC
+
+  - id: monthly_price_trend
+    type: line
+    title: Avg & median price by month
+    description: Is pricing drifting up or down over time?
+    format: currency
+    x: month
+    y: price
+    color: stat
+    sql: |
+      WITH monthly AS (
+        SELECT
+          date_trunc('month', purchase_date)::DATE AS month,
+          AVG(price_cents) / 100.0                 AS avg_price,
+          quantile_cont(price_cents / 100.0, 0.5)  AS median_price
+        FROM fct_token_purchase
+        WHERE is_purchased AND purchase_date IS NOT NULL
+        GROUP BY 1
+      )
+      SELECT month, 'avg'    AS stat, avg_price    AS price FROM monthly
+      UNION ALL
+      SELECT month, 'median' AS stat, median_price AS price FROM monthly
+      ORDER BY month, stat
+
+  - id: asp_per_author
+    type: histogram
+    title: Avg selling price per author
+    description: For each author with sales, what's their typical per-token price? Shows how varied pricing is across the catalog.
+    format: currency
+    x: avg_price
+    nbins: 30
+    sql: |
+      SELECT
+        gmv_cents::DOUBLE / NULLIF(tokens_sold, 0) / 100.0 AS avg_price
+      FROM dim_author
+      WHERE tokens_sold > 0

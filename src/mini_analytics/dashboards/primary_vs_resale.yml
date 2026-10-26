@@ -1,0 +1,160 @@
+id: primary_vs_resale
+title: Primary vs Resale Mix
+description: How much of the revenue is primary-market (purchase_from_author) vs secondary (purchase_from_resale)? Is resale growing?
+
+blocks:
+  # --- Context ------------------------------------------------------------
+  - id: note_resale_semantics
+    type: note
+    title: Resale only exists for some books
+    body: |
+      Each token is one numbered digital copy of a book. Resale is **not automatic**: it only exists for **limited-supply** books whose author explicitly **enabled resale** at publish time.
+
+      • **Unlimited-supply books** can't have a secondary market: the author can always issue new copies, so there's nothing scarce to resell.
+      • **Limited books with resale disabled** also have no secondary market. Once the last copy is sold, it stops.
+      • Only **limited books with resale enabled** produce `flow_type = 'purchase_from_resale'` rows.
+
+      The per-book supply type and resale flag aren't in the CSVs. A low resale share can therefore mean "most books are unlimited or opted out", not "nobody wants to resell".
+
+  # --- KPIs ---------------------------------------------------------------
+  - id: kpi_primary_gmv
+    type: kpi
+    title: Primary GMV
+    format: currency
+    subtitle: Purchases from author
+    sql: |
+      SELECT COALESCE(SUM(price_cents), 0) / 100.0 AS value
+      FROM fct_token_purchase
+      WHERE is_purchased AND flow_type = 'purchase_from_author'
+
+  - id: kpi_resale_gmv
+    type: kpi
+    title: Resale GMV
+    format: currency
+    subtitle: Purchases from resale
+    sql: |
+      SELECT COALESCE(SUM(price_cents), 0) / 100.0 AS value
+      FROM fct_token_purchase
+      WHERE is_purchased AND flow_type = 'purchase_from_resale'
+
+  - id: kpi_resale_share
+    type: kpi
+    title: Resale share of GMV
+    format: percent
+    sql: |
+      WITH t AS (
+        SELECT
+          SUM(CASE WHEN flow_type = 'purchase_from_resale' THEN price_cents END) AS resale,
+          SUM(price_cents)                                                        AS total
+        FROM fct_token_purchase
+        WHERE is_purchased
+      )
+      SELECT COALESCE(resale, 0)::DOUBLE / NULLIF(total, 0) AS value FROM t
+
+  - id: kpi_resale_price_premium
+    type: kpi
+    title: Resale price premium
+    format: percent
+    subtitle: avg(resale) ÷ avg(primary) − 1
+    sql: |
+      WITH avgs AS (
+        SELECT
+          AVG(CASE WHEN flow_type = 'purchase_from_author' THEN price_cents END) AS p,
+          AVG(CASE WHEN flow_type = 'purchase_from_resale' THEN price_cents END) AS r
+        FROM fct_token_purchase
+        WHERE is_purchased
+      )
+      SELECT CASE WHEN p IS NULL OR p = 0 THEN NULL ELSE (r / p) - 1 END AS value FROM avgs
+
+  # --- Charts -------------------------------------------------------------
+  - id: gmv_split_monthly
+    type: area_stacked
+    title: Monthly GMV by flow type
+    description: Absolute revenue per month, stacked by primary / resale / unknown.
+    format: currency
+    x: month
+    y: gmv
+    color: flow_type
+    sql: |
+      SELECT
+        date_trunc('month', purchase_date)::DATE AS month,
+        flow_type,
+        SUM(price_cents) / 100.0 AS gmv
+      FROM fct_token_purchase
+      WHERE is_purchased AND purchase_date IS NOT NULL
+      GROUP BY 1, 2
+      ORDER BY 1, 2
+
+  - id: volume_split_monthly
+    type: area_stacked
+    title: Monthly purchase volume by flow type
+    description: Token count per month, stacked — shows mix of transactions, not just dollars.
+    format: integer
+    x: month
+    y: purchases
+    color: flow_type
+    sql: |
+      SELECT
+        date_trunc('month', purchase_date)::DATE AS month,
+        flow_type,
+        COUNT(*) AS purchases
+      FROM fct_token_purchase
+      WHERE is_purchased AND purchase_date IS NOT NULL
+      GROUP BY 1, 2
+      ORDER BY 1, 2
+
+  - id: resale_share_trend
+    type: line
+    title: Resale share of GMV — monthly
+    description: Share of each month's GMV that came from the resale flow. A rising line = secondary market is growing relative to primary.
+    format: percent
+    x: month
+    y: resale_share
+    sql: |
+      SELECT
+        month,
+        COALESCE(resale, 0)::DOUBLE / NULLIF(total, 0) AS resale_share
+      FROM (
+        SELECT
+          date_trunc('month', purchase_date)::DATE AS month,
+          SUM(CASE WHEN flow_type = 'purchase_from_resale' THEN price_cents END) AS resale,
+          SUM(price_cents)                                                        AS total
+        FROM fct_token_purchase
+        WHERE is_purchased AND purchase_date IS NOT NULL
+        GROUP BY 1
+      ) t
+      ORDER BY month
+
+  - id: flow_type_stats
+    type: table
+    title: Flow-type price & volume stats
+    description: Per-flow purchases, GMV, avg / median / p90 price.
+    sql: |
+      SELECT
+        flow_type,
+        COUNT(*)                                                       AS purchases,
+        ROUND(SUM(price_cents) / 100.0, 2)                             AS gmv_usd,
+        ROUND(AVG(price_cents)  / 100.0, 2)                            AS avg_price_usd,
+        ROUND(quantile_cont(price_cents / 100.0, 0.5), 2)              AS median_price_usd,
+        ROUND(quantile_cont(price_cents / 100.0, 0.9), 2)              AS p90_price_usd
+      FROM fct_token_purchase
+      WHERE is_purchased
+      GROUP BY flow_type
+      ORDER BY gmv_usd DESC
+
+  - id: top_resold_books
+    type: table
+    title: Books with the most resale activity
+    description: Books ranked by resale GMV. Useful for identifying which titles have a secondary market.
+    sql: |
+      SELECT
+        COALESCE(book_title, '(unknown)')                           AS book,
+        COALESCE(author_name, '(unknown)')                          AS author,
+        COUNT(*)                                                    AS resale_purchases,
+        ROUND(SUM(price_cents) / 100.0, 2)                          AS resale_gmv_usd,
+        ROUND(AVG(price_cents) / 100.0, 2)                          AS avg_resale_price
+      FROM fct_token_purchase
+      WHERE is_purchased AND flow_type = 'purchase_from_resale'
+      GROUP BY 1, 2
+      ORDER BY resale_gmv_usd DESC
+      LIMIT 20

@@ -1,0 +1,266 @@
+id: site_activity
+title: Site Activity - Web Traffic & Engagement
+description: Historical Google Analytics events from the marketplace's website. All available daily exports are unioned together.
+
+blocks:
+  # --- Context ------------------------------------------------------------
+  - id: note_site_activity
+    type: note
+    title: About this dashboard
+    body: |
+      Google Analytics events from the marketplace's website. The upstream job exports one CSV per calendar day. `mini-analytics fetch` downloads every file in the GA prefix to `data/raw/ga_events/`, and the loader unions them through a glob, so this dashboard reflects the **entire window** covered by the available exports.
+
+      A few semantics:
+      • A **session** is one continuous visit by one device, identified by `session_id`. One device can have several sessions per day.
+      • **`user_pseudo_id`** is GA's pseudonymous device identifier. It does **not** join to any buyer identifier in the rest of this project.
+      • **`first_visit`** events identify devices visiting the site for the first time.
+      • Timestamps are timezone-aware (UTC).
+
+  # --- KPIs ---------------------------------------------------------------
+  - id: kpi_events
+    type: kpi
+    title: Events
+    format: integer
+    subtitle: All event types, all days
+    sql: SELECT COUNT(*) AS value FROM ga_events
+
+  - id: kpi_days
+    type: kpi
+    title: Days covered
+    format: integer
+    subtitle: Distinct event_date values
+    sql: SELECT COUNT(DISTINCT event_date) AS value FROM ga_events
+
+  - id: kpi_avg_events_per_day
+    type: kpi
+    title: Avg events / day
+    format: integer
+    subtitle: Across all days with any activity
+    sql: |
+      SELECT COUNT(*)::DOUBLE / NULLIF(COUNT(DISTINCT event_date), 0) AS value
+      FROM ga_events
+
+  - id: kpi_sessions
+    type: kpi
+    title: Sessions
+    format: integer
+    subtitle: Distinct session_id, all days
+    sql: SELECT COUNT(DISTINCT session_id) AS value FROM ga_events
+
+  - id: kpi_devices
+    type: kpi
+    title: Unique devices
+    format: integer
+    subtitle: Distinct user_pseudo_id
+    sql: SELECT COUNT(DISTINCT user_pseudo_id) AS value FROM ga_events
+
+  # --- Charts -------------------------------------------------------------
+  - id: events_per_day
+    type: line
+    title: Events per day
+    description: Every recorded event type, by calendar day. The headline trend chart.
+    format: integer
+    x: day
+    y: events
+    wide: true
+    sql: |
+      SELECT
+        event_date         AS day,
+        COUNT(*)           AS events
+      FROM ga_events
+      GROUP BY event_date
+      ORDER BY event_date
+
+  - id: sessions_per_day
+    type: line
+    title: Sessions per day
+    description: Distinct session count by calendar day. Smooths out high-volume event types like scroll.
+    format: integer
+    x: day
+    y: sessions
+    wide: true
+    sql: |
+      SELECT
+        event_date                 AS day,
+        COUNT(DISTINCT session_id) AS sessions
+      FROM ga_events
+      GROUP BY event_date
+      ORDER BY event_date
+
+  - id: events_by_weekday
+    type: bar
+    title: Avg events by day of week
+    description: Mean events per occurrence of each weekday across the whole window.
+    format: integer
+    x: weekday
+    y: avg_events
+    sql: |
+      WITH daily AS (
+        SELECT
+          event_date,
+          EXTRACT('isodow' FROM event_date)::INTEGER AS dow,
+          COUNT(*) AS events
+        FROM ga_events
+        GROUP BY event_date
+      )
+      SELECT
+        CASE dow
+          WHEN 1 THEN 'Mon' WHEN 2 THEN 'Tue' WHEN 3 THEN 'Wed' WHEN 4 THEN 'Thu'
+          WHEN 5 THEN 'Fri' WHEN 6 THEN 'Sat' WHEN 7 THEN 'Sun'
+        END                AS weekday,
+        ROUND(AVG(events)) AS avg_events,
+        dow                AS ord
+      FROM daily
+      GROUP BY dow
+      ORDER BY ord
+
+  - id: events_by_hour
+    type: bar
+    title: Avg events by hour of day (UTC)
+    description: Mean events per hour, averaged across days that had any events. Hours with no activity show as zero.
+    format: integer
+    x: hour
+    y: avg_events
+    sql: |
+      WITH hours AS (
+        SELECT UNNEST(range(0, 24)) AS hour
+      ),
+      per_day_hour AS (
+        SELECT
+          event_date,
+          EXTRACT('hour' FROM event_timestamp)::INTEGER AS hour,
+          COUNT(*) AS events
+        FROM ga_events
+        GROUP BY event_date, hour
+      )
+      SELECT
+        h.hour,
+        ROUND(COALESCE(AVG(p.events), 0)) AS avg_events
+      FROM hours h
+      LEFT JOIN per_day_hour p ON p.hour = h.hour
+      GROUP BY h.hour
+      ORDER BY h.hour
+
+  - id: event_types
+    type: bar
+    title: Events by type (all days)
+    description: What users do across the full history.
+    format: integer
+    x: event_name
+    y: events
+    sql: |
+      SELECT event_name, COUNT(*) AS events
+      FROM ga_events
+      GROUP BY event_name
+      ORDER BY events DESC
+
+  - id: device_breakdown
+    type: bar
+    title: Sessions by device and OS
+    description: Distinct sessions per device-category and OS pair, across the whole window.
+    format: integer
+    x: device
+    y: sessions
+    sql: |
+      SELECT
+        device_category || ' / ' || device_os AS device,
+        COUNT(DISTINCT session_id)            AS sessions
+      FROM ga_events
+      GROUP BY device
+      ORDER BY sessions DESC
+
+  - id: top_pages
+    type: bar
+    title: Top pages by views (all days)
+    description: Pages by `page_view` count across the full window. Long titles trimmed to 60 characters.
+    format: integer
+    x: views
+    y: page
+    orientation: h
+    height: 460
+    wide: true
+    sql: |
+      WITH top AS (
+        SELECT
+          LEFT(COALESCE(page_title, '(no title)'), 60) AS page,
+          COUNT(*)                                     AS views
+        FROM ga_events
+        WHERE event_name = 'page_view'
+        GROUP BY 1
+        ORDER BY views DESC
+        LIMIT 15
+      )
+      SELECT page, views FROM top ORDER BY views ASC
+
+  - id: top_countries
+    type: bar
+    title: Sessions by country (top 10)
+    format: integer
+    x: country
+    y: sessions
+    sql: |
+      SELECT
+        COALESCE(country, '(unknown)') AS country,
+        COUNT(DISTINCT session_id)     AS sessions
+      FROM ga_events
+      GROUP BY country
+      ORDER BY sessions DESC
+      LIMIT 10
+
+  - id: top_sources
+    type: bar
+    title: Sessions by traffic source (top 10)
+    format: integer
+    x: source
+    y: sessions
+    sql: |
+      SELECT
+        COALESCE(traffic_source, '(unknown)') AS source,
+        COUNT(DISTINCT session_id)            AS sessions
+      FROM ga_events
+      GROUP BY source
+      ORDER BY sessions DESC
+      LIMIT 10
+
+  # --- Tables -------------------------------------------------------------
+  - id: traffic_source_medium
+    type: table
+    title: Sessions by source and medium
+    description: Distinct sessions and total events per traffic source-medium pair, across the entire window.
+    sql: |
+      SELECT
+        COALESCE(traffic_source, '(unknown)') AS source,
+        COALESCE(traffic_medium, '(none)')    AS medium,
+        COUNT(DISTINCT session_id)            AS sessions,
+        COUNT(*)                              AS events
+      FROM ga_events
+      GROUP BY source, medium
+      ORDER BY sessions DESC, events DESC
+
+  - id: recent_days
+    type: table
+    title: Last 30 days, day by day
+    description: Headline metrics for each of the last 30 days with activity.
+    sql: |
+      WITH recent AS (
+        SELECT
+          event_date,
+          COUNT(*)                                                          AS events,
+          COUNT(DISTINCT session_id)                                         AS sessions,
+          COUNT(DISTINCT user_pseudo_id)                                     AS devices,
+          COUNT(*) FILTER (WHERE event_name = 'page_view')                   AS page_views,
+          COUNT(*) FILTER (WHERE event_name = 'first_visit')                 AS first_visits
+        FROM ga_events
+        GROUP BY event_date
+        ORDER BY event_date DESC
+        LIMIT 30
+      )
+      SELECT
+        event_date AS day,
+        events,
+        sessions,
+        devices,
+        page_views,
+        first_visits
+      FROM recent
+      ORDER BY day DESC

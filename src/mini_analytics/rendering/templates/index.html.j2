@@ -1,0 +1,16 @@
+{% extends "base.html.j2" %}
+{% set home_href = "index.html" %}
+{% block title %}Dashboards · Mini Analytics{% endblock %}
+{% block content %}
+  <h2 class="page-title">Dashboards</h2>
+  <p class="page-desc">Select a dashboard to view.</p>
+  <div class="kpi-strip">
+    {% for d in dashboards %}
+    <a class="kpi" href="{{ d.id }}/index.html" style="text-decoration:none; color:inherit;">
+      <div class="kpi-label">{{ d.id.replace('_', ' ') }}</div>
+      <div class="kpi-value" style="font-size:18px;">{{ d.title }}</div>
+      {% if d.description %}<div class="kpi-subtitle">{{ d.description }}</div>{% endif %}
+    </a>
+    {% endfor %}
+  </div>
+{% endblock %}

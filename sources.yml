@@ -1,0 +1,26 @@
+loader: csv
+
+csv:
+  root: data/raw
+
+# Optional: pull the latest CSV from each S3 prefix into `csv.root` before building.
+# Run with `mini-analytics fetch` (one-shot) or `mini-analytics build --refresh`.
+# Credentials come from the standard AWS chain (env vars or a ~/.aws/credentials
+# profile), never from this file. Remove this block if you only use local CSVs.
+s3:
+  bucket: your-export-bucket
+  region: us-east-1
+  profile: mini-analytics
+  download_to: data/raw
+  prefixes:
+    authors:         exports/authors/
+    books:           exports/books/
+    tokens:          exports/tokens/
+    token_purchases: exports/token_purchases/
+    ga_events:       imports/ga_events/
+
+  # Tables whose prefix holds one *slice* per file (not a full snapshot).
+  # Fetch downloads every matching object into data/raw/<table>/, and the
+  # CSV loader reads them through a glob so all slices union together.
+  fetch_all:
+    - ga_events

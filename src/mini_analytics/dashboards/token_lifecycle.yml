@@ -1,0 +1,115 @@
+id: token_lifecycle
+title: Token Lifecycle & Quality
+description: How's the product working? Issue-to-purchase flow, price spread, and a data-quality audit.
+
+blocks:
+  # --- Context ------------------------------------------------------------
+  - id: note_lifecycle_semantics
+    type: note
+    title: What "issued" really means
+    body: |
+      A **token is one numbered digital copy of a book**, issued **before** the buyer completes checkout with the payment provider. So an issued token isn't inventory on a shelf: it's a reserved copy that may or may not end up with a buyer. The gap between issued and purchased can come from any of these causes, which the dataset can't tell apart:
+
+      • Buyer closed the browser mid-checkout · the payment provider declined · the marketplace failed to record a successful payment · the book is unlimited-supply and simply hasn't sold all its copies yet.
+
+      Treat per-book "purchase rate" numbers as directional, not as retail sell-through. The `book_supply_type` flag isn't in the CSVs.
+
+  # --- KPIs ---------------------------------------------------------------
+  - id: kpi_tokens_issued
+    type: kpi
+    title: Tokens issued
+    format: integer
+    sql: SELECT COUNT(*) AS value FROM tokens
+
+  - id: kpi_tokens_with_any_purchase
+    type: kpi
+    title: Tokens with any purchase row
+    format: integer
+    subtitle: Distinct tokens with ≥1 row in token_purchases (any state)
+    sql: SELECT COUNT(DISTINCT token_id) AS value FROM token_purchases
+
+  - id: kpi_tokens_purchased
+    type: kpi
+    title: Tokens purchased
+    format: integer
+    subtitle: state = 'purchased'
+    sql: |
+      SELECT COUNT(DISTINCT token_id) AS value
+      FROM fct_token_purchase
+      WHERE is_purchased
+
+  - id: kpi_purchase_rate
+    type: kpi
+    title: Purchase rate
+    format: percent
+    subtitle: purchased ÷ issued
+    sql: |
+      SELECT
+        (SELECT COUNT(DISTINCT token_id) FROM fct_token_purchase WHERE is_purchased)::DOUBLE
+        / NULLIF((SELECT COUNT(*) FROM tokens), 0) AS value
+
+  # --- Charts -------------------------------------------------------------
+  - id: funnel_tokens
+    type: bar
+    title: Token lifecycle funnel
+    description: Issued → has any purchase row → actually purchased.
+    format: integer
+    x: stage
+    y: tokens
+    wide: true
+    sql: |
+      WITH steps AS (
+        SELECT 'Issued'         AS stage, COUNT(*)                  AS tokens, 1 AS ord
+          FROM tokens
+        UNION ALL
+        SELECT 'Has purchase',            COUNT(DISTINCT token_id),    2
+          FROM token_purchases
+        UNION ALL
+        SELECT 'Purchased',               COUNT(DISTINCT token_id),    3
+          FROM fct_token_purchase WHERE is_purchased
+      )
+      SELECT stage, tokens FROM steps ORDER BY ord
+
+  - id: purchase_rate_by_book
+    type: histogram
+    title: Purchase rate by book
+    description: For each book, what share of its issued tokens have been purchased? A mass near 0 is books where most issued tokens haven't completed checkout yet (see the note at the top for the four possible reasons).
+    format: percent
+    x: purchase_rate
+    nbins: 25
+    sql: |
+      SELECT
+        CASE WHEN token_count > 0 THEN tokens_sold::DOUBLE / token_count ELSE 0 END
+          AS purchase_rate
+      FROM dim_book
+      WHERE token_count > 0
+
+  - id: price_by_flow
+    type: histogram
+    title: Price distribution by flow type
+    description: How primary (purchase from author) and resale pricing compare on purchased tokens.
+    format: currency
+    x: price_usd
+    color: flow_type
+    nbins: 25
+    sql: |
+      SELECT
+        price_cents / 100.0 AS price_usd,
+        flow_type
+      FROM fct_token_purchase
+      WHERE is_purchased
+
+  - id: unknown_flow_audit
+    type: table
+    title: Unknown-flow purchases — audit
+    description: Every purchased row with flow_type = 'unknown'. Data-quality bucket; should trend to zero.
+    sql: |
+      SELECT
+        purchase_id,
+        purchase_date,
+        COALESCE(author_name, '(unnamed)') AS author,
+        book_title,
+        ROUND(price_cents / 100.0, 2)       AS price_usd
+      FROM fct_token_purchase
+      WHERE is_purchased AND flow_type = 'unknown'
+      ORDER BY purchase_date DESC NULLS LAST

@@ -1,0 +1,102 @@
+id: revenue_overview
+title: Revenue Overview
+description: How's business? Top-line GMV, volume, pricing, and active supply.
+
+blocks:
+  # --- KPI strip ----------------------------------------------------------
+  - id: kpi_gmv_total
+    type: kpi
+    title: Total GMV
+    format: currency
+    sql: |
+      SELECT COALESCE(SUM(price_cents), 0) / 100.0 AS value
+      FROM fct_token_purchase
+      WHERE is_purchased
+
+  - id: kpi_tokens_purchased
+    type: kpi
+    title: Tokens purchased
+    format: integer
+    sql: |
+      SELECT COUNT(*) AS value
+      FROM fct_token_purchase
+      WHERE is_purchased
+
+  - id: kpi_avg_selling_price
+    type: kpi
+    title: Avg selling price
+    format: currency
+    sql: |
+      SELECT COALESCE(AVG(price_cents), 0) / 100.0 AS value
+      FROM fct_token_purchase
+      WHERE is_purchased
+
+  - id: kpi_active_authors
+    type: kpi
+    title: Authors with sales
+    format: integer
+    subtitle: Distinct authors with ≥1 purchased token
+    sql: |
+      SELECT COUNT(DISTINCT author_id) AS value
+      FROM fct_token_purchase
+      WHERE is_purchased AND author_id IS NOT NULL
+
+  # --- Charts -------------------------------------------------------------
+  - id: gmv_by_month
+    type: line
+    title: GMV by month
+    description: Purchased-token revenue per calendar month (USD).
+    format: currency
+    x: month
+    y: gmv
+    sql: |
+      SELECT
+        date_trunc('month', purchase_date)::DATE AS month,
+        SUM(price_cents) / 100.0                 AS gmv
+      FROM fct_token_purchase
+      WHERE is_purchased AND purchase_date IS NOT NULL
+      GROUP BY 1
+      ORDER BY 1
+
+  - id: gmv_by_flow_monthly
+    type: area_stacked
+    title: GMV by flow type (monthly)
+    description: Primary (purchase_from_author) vs resale vs unknown split, stacked.
+    format: currency
+    x: month
+    y: gmv
+    color: flow_type
+    sql: |
+      SELECT
+        date_trunc('month', purchase_date)::DATE AS month,
+        flow_type                                AS flow_type,
+        SUM(price_cents) / 100.0                 AS gmv
+      FROM fct_token_purchase
+      WHERE is_purchased AND purchase_date IS NOT NULL
+      GROUP BY 1, 2
+      ORDER BY 1, 2
+
+  - id: purchases_rolling_30d
+    type: line
+    title: Daily purchases · 30-day rolling avg
+    description: Smooths day-to-day noise to show momentum.
+    format: number
+    x: day
+    y: rolling_avg
+    sql: |
+      WITH daily AS (
+        SELECT
+          purchase_date AS day,
+          COUNT(*)      AS purchases
+        FROM fct_token_purchase
+        WHERE is_purchased AND purchase_date IS NOT NULL
+        GROUP BY 1
+      )
+      SELECT
+        day,
+        AVG(purchases) OVER (
+          ORDER BY day
+          ROWS BETWEEN 29 PRECEDING AND CURRENT ROW
+        ) AS rolling_avg
+      FROM daily
+      ORDER BY day
